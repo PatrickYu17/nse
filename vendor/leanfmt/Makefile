@@ -1,0 +1,29 @@
+.PHONY: all build test lint fixtures profile check shellcheck
+
+all: check
+
+build:
+	time lake build --wfail
+
+test:
+	time lake test --wfail
+
+lint:
+	time lake -d tools/linter exe runLinter
+
+fixtures:
+	time lake exe fmt-test --update-fixture --check Tests/Fixtures/*/*.leanfmt
+
+shellcheck:
+	shellcheck --severity=warning scripts/*.sh
+
+profile:
+	time scripts/profile-baseline.sh
+
+check: build test lint fixtures
+	time lake exe fmt --check --check-exception --check-idempotent -r LeanFmt
+	git diff --check
+
+fmt:
+	time lake exe fmt -r LeanFmt
+	make check

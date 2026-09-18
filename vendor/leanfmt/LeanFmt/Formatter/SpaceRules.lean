@@ -1,0 +1,601 @@
+import LeanFmt.SyntaxTree
+
+namespace LeanFmt
+namespace Formatter
+namespace SpaceRules
+
+def maxPreservedNewlines : Nat :=
+  2
+
+def isHorizontalWhitespace : Char → Bool
+  | ' ' => true
+  | '\t' => true
+  | _ => false
+
+def normalizeLineEndings (text : String) : String :=
+  -- ASCII delimiter bytes cannot occur inside a multibyte UTF-8 character.
+  if (text.toByteArray.findIdx? (· == '\r'.toUInt8)).isSome then
+    (text.replace "\r\n" "\n").replace "\r" "\n"
+  else
+    text
+
+def stripLineEndWhitespace (line : String) : String :=
+  (line.dropEndWhile isHorizontalWhitespace).toString
+
+def stripTrailingWhitespace (text : String) : String :=
+  String.intercalate "\n"
+  <| (normalizeLineEndings text).splitOn "\n" |>.map stripLineEndWhitespace
+
+def stripWhitespaceBeforeNewlines (text : String) : String :=
+  let lines := (normalizeLineEndings text).splitOn "\n"
+  match lines.reverse with
+  | [] => ""
+  | last :: reversedPrefix =>
+      String.intercalate "\n"
+      <| (reversedPrefix.reverse.map stripLineEndWhitespace) ++ [last]
+
+def collapseNewlineRunsAux : List Char → Nat → List Char → List Char
+  | [], _, acc => acc.reverse
+  | char :: rest, newlineCount, acc =>
+      if char == '\n' then
+        if newlineCount < maxPreservedNewlines then
+          collapseNewlineRunsAux rest (newlineCount + 1) (char :: acc)
+        else
+          collapseNewlineRunsAux rest (newlineCount + 1) acc
+      else
+        collapseNewlineRunsAux rest 0 (char :: acc)
+
+def collapseNewlineRuns (text : String) : String :=
+  String.ofList <| collapseNewlineRunsAux text.toList 0 []
+
+def cleanWhitespaceTrivia (text : String) : String :=
+  collapseNewlineRuns <| stripWhitespaceBeforeNewlines text
+
+def collapseWhitespaceTrivia (text : String) : String :=
+  if text.isEmpty then "" else " "
+
+private def lineCommentStop (bytes : ByteArray) (start : Nat) : Nat :=
+  Id.run do
+    let mut index := start
+    while index < bytes.size do
+      if bytes[index]! == '\n'.toUInt8 then return index
+      index := index + 1
+    return bytes.size
+
+private def blockCommentStop (bytes : ByteArray) (start : Nat) : Nat :=
+  Id.run do
+    let mut cursor := start
+    let mut depth := 1
+    while cursor < bytes.size do
+      let byte := bytes[cursor]!
+      let next := bytes[cursor + 1]?.getD 0
+      if byte == '/'.toUInt8 && next == '-'.toUInt8 then
+        depth := depth + 1
+        cursor := cursor + 2
+      else if byte == '-'.toUInt8 && next == '/'.toUInt8 then
+        depth := depth - 1
+        if depth == 0 then return cursor + 2
+        cursor := cursor + 2
+      else
+        cursor := cursor + 1
+    return bytes.size
+
+def normalizeTrivia (normalizeWhitespace : String → String) (text : String) : String :=
+  Id.run do
+    let text := normalizeLineEndings text
+    let bytes := text.toByteArray
+    let mut start := 0
+    let mut cursor := 0
+    let mut pieces := #[]
+    -- ASCII comment delimiters are UTF-8 boundaries; retain comment slices verbatim.
+    while cursor < bytes.size do
+      let byte := bytes[cursor]!
+      let next := bytes[cursor + 1]?.getD 0
+      if next == '-'.toUInt8 && (byte == '/'.toUInt8 || byte == '-'.toUInt8) then
+        let stop :=
+          if byte == '/'.toUInt8 then
+            blockCommentStop bytes (cursor + 2)
+          else
+            lineCommentStop bytes (cursor + 2)
+        pieces :=
+          pieces.push (normalizeWhitespace (SyntaxTree.sourceText text ⟨start⟩ ⟨cursor⟩))
+        pieces := pieces.push (SyntaxTree.sourceText text ⟨cursor⟩ ⟨stop⟩)
+        start := stop
+        cursor := stop
+      else
+        cursor := cursor + 1
+    pieces :=
+      pieces.push (normalizeWhitespace (SyntaxTree.sourceText text ⟨start⟩ ⟨bytes.size⟩))
+    return String.join pieces.toList
+
+def cleanTrivia (text : String) : String :=
+  normalizeTrivia cleanWhitespaceTrivia text
+
+def inlineCommentTrivia (text : String) : String :=
+  normalizeTrivia collapseWhitespaceTrivia text
+
+def commentForcesLineBreak (text : String) : Bool :=
+  Id.run do -- Only ASCII delimiters matter; no comment text or normalized copy is needed.
+    let bytes := text.toByteArray
+    let mut start := 0
+    let mut depth := 0
+    while start < bytes.size do
+      let byte := bytes[start]!
+      let next := bytes[start + 1]?.getD 0
+      if depth > 0 && (byte == '\n'.toUInt8 || byte == '\r'.toUInt8) then
+        return true
+      else if byte == '/'.toUInt8 && next == '-'.toUInt8 then
+        depth := depth + 1
+        start := start + 2
+      else if depth == 0 && byte == '-'.toUInt8 && next == '-'.toUInt8 then
+        return true
+      else if depth > 0 && byte == '-'.toUInt8 && next == '/'.toUInt8 then
+        depth := depth - 1
+        start := start + 2
+      else
+        start := start + 1
+    return false
+
+def stripLeadingHorizontalWhitespace (line : String) : String :=
+  (line.dropWhile isHorizontalWhitespace).toString
+
+def containsSubstring (text needle : String) : Bool :=
+  text.contains needle
+
+partial def blockCommentDepthAfterChars : Nat → List Char → Nat
+  | depth, '/' :: '-' :: rest =>
+      blockCommentDepthAfterChars (depth + 1) rest
+  | depth, '-' :: '/' :: rest =>
+      blockCommentDepthAfterChars (depth - 1) rest
+  | depth, _ :: rest => blockCommentDepthAfterChars depth rest
+  | depth, [] => depth
+
+def blockCommentDepthAfterLine (depth : Nat) (line : String) : Nat :=
+  if depth == 0 then
+    let stripped := stripLeadingHorizontalWhitespace line
+    if stripped.startsWith "/-" then
+      blockCommentDepthAfterChars 0 stripped.toList
+    else
+      0
+  else
+    blockCommentDepthAfterChars depth line.toList
+
+def lineOpensBlockComment (line : String) : Bool :=
+  0 < blockCommentDepthAfterLine 0 line
+
+def reindentCommentLine (blockCommentDepth : Nat) (line indent : String) : String :=
+  if 0 < blockCommentDepth then
+    line
+  else
+    let stripped := stripLeadingHorizontalWhitespace line
+    if stripped.isEmpty then "" else indent ++ stripped
+
+def shiftCommentLineIndent (sourceIndent targetIndent : Nat) (line : String) : String :=
+  if line.isEmpty || sourceIndent == targetIndent then
+    line
+  else if sourceIndent < targetIndent then
+    String.ofList (List.replicate (targetIndent - sourceIndent) ' ') ++ line
+  else
+    let leadingLength := line.length - (stripLeadingHorizontalWhitespace line).length
+    (line.drop (min (sourceIndent - targetIndent) leadingLength)).toString
+
+def reindentCommentLexeme (text : String) (sourceIndent targetIndent : Nat) : String :=
+  match (normalizeLineEndings text).splitOn "\n" with
+  | [] => ""
+  | firstLine :: rest =>
+      String.intercalate "\n"
+      <| firstLine :: rest.map (shiftCommentLineIndent sourceIndent targetIndent)
+
+def reindentCommentLines (indent : String) : Nat → Nat → List String → List String
+  | _, _, [] => []
+  | blockCommentDepth, blockSourceIndent, line :: rest =>
+      let stripped := stripLeadingHorizontalWhitespace line
+      let blockSourceIndent :=
+        if blockCommentDepth == 0 && stripped.startsWith "/-" then
+          line.length - stripped.length
+        else
+          blockSourceIndent
+      let adjusted :=
+        if rest.isEmpty && blockCommentDepth == 0 && stripped.isEmpty then
+          indent
+        else if 0 < blockCommentDepth then
+          shiftCommentLineIndent blockSourceIndent indent.length line
+        else
+          reindentCommentLine blockCommentDepth line indent
+      let blockCommentDepth := blockCommentDepthAfterLine blockCommentDepth line
+      let blockSourceIndent := if blockCommentDepth == 0 then 0 else blockSourceIndent
+      adjusted :: reindentCommentLines indent blockCommentDepth blockSourceIndent rest
+
+def reindentBoundaryCommentLines (commentIndent followingIndent : String)
+    : Nat → Nat → Nat → Bool → Bool → Bool → List String → List String
+  | _, _, _, _, _, _, [] => []
+  | blockCommentDepth,
+    blockSourceIndent,
+    blockTargetIndent,
+    useFollowingIndent,
+    seenComment,
+    sawBlank,
+    line :: rest =>
+      let stripped := stripLeadingHorizontalWhitespace line
+      if 0 < blockCommentDepth then
+        let adjusted := shiftCommentLineIndent blockSourceIndent blockTargetIndent line
+        let nextDepth := blockCommentDepthAfterLine blockCommentDepth line
+        adjusted
+        :: reindentBoundaryCommentLines commentIndent followingIndent nextDepth
+            blockSourceIndent blockTargetIndent useFollowingIndent seenComment sawBlank
+            rest
+      else
+        let startsComment := stripped.startsWith "--" || stripped.startsWith "/-"
+        let useFollowingIndent :=
+          useFollowingIndent || (startsComment && seenComment && sawBlank)
+        let indent := if useFollowingIndent then followingIndent else commentIndent
+        let adjusted :=
+          if rest.isEmpty && stripped.isEmpty then
+            indent
+          else
+            reindentCommentLine 0 line indent
+        let nextDepth := blockCommentDepthAfterLine 0 line
+        let blockSourceIndent :=
+          if startsComment && 0 < nextDepth then line.length - stripped.length else 0
+        let seenComment := seenComment || startsComment
+        let sawBlank :=
+          if stripped.isEmpty then
+            sawBlank || seenComment
+          else if startsComment then
+            false
+          else
+            sawBlank
+        adjusted
+        :: reindentBoundaryCommentLines commentIndent followingIndent nextDepth
+            blockSourceIndent indent.length useFollowingIndent seenComment sawBlank rest
+
+def reindentCommentTriviaWithFollowingGroup (text commentIndent followingIndent : String)
+    : String :=
+  match (cleanTrivia text).splitOn "\n" with
+  | [] => ""
+  | firstLine :: rest =>
+      let strippedFirst := stripLeadingHorizontalWhitespace firstLine
+      let firstStartsComment :=
+        strippedFirst.startsWith "--" || strippedFirst.startsWith "/-"
+      let firstBlockDepth := blockCommentDepthAfterLine 0 firstLine
+      let firstBlockSourceIndent :=
+        if firstStartsComment && 0 < firstBlockDepth then
+          firstLine.length - strippedFirst.length
+        else
+          0
+      String.intercalate "\n"
+      <| firstLine
+          :: reindentBoundaryCommentLines commentIndent followingIndent firstBlockDepth
+              firstBlockSourceIndent commentIndent.length false firstStartsComment false
+              rest
+
+def reindentCommentTrivia (text indent : String) : String :=
+  match (cleanTrivia text).splitOn "\n" with
+  | [] => ""
+  | firstLine :: rest =>
+      let strippedFirst := stripLeadingHorizontalWhitespace firstLine
+      let firstBlockSourceIndent :=
+        if strippedFirst.startsWith "/-" then
+          firstLine.length - strippedFirst.length
+        else
+          0
+      String.intercalate "\n"
+      <| firstLine
+          :: reindentCommentLines indent
+              (blockCommentDepthAfterLine 0 firstLine)
+              firstBlockSourceIndent rest
+
+def commentTriviaHasSeparatedGroups (text : String) : Bool :=
+  let rec loop (blockCommentDepth : Nat) (seenComment sawBlank : Bool)
+      : List String → Bool
+    | [] => false
+    | line :: rest =>
+        let stripped := stripLeadingHorizontalWhitespace line
+        let nextBlockCommentDepth := blockCommentDepthAfterLine blockCommentDepth line
+        if blockCommentDepth == 0 && stripped.isEmpty then
+          loop nextBlockCommentDepth seenComment (sawBlank || seenComment) rest
+        else if blockCommentDepth == 0
+                && (stripped.startsWith "--" || stripped.startsWith "/-") then
+          if seenComment && sawBlank then
+            true
+          else
+            loop nextBlockCommentDepth true false rest
+        else
+          loop nextBlockCommentDepth seenComment sawBlank rest
+  loop 0 false false <| (normalizeLineEndings text).splitOn "\n"
+
+def reindentableCommentWidth (text : String) : Nat :=
+  let rec loop (blockCommentDepth maximum : Nat) : List String → Nat
+    | [] => maximum
+    | line :: rest =>
+        let stripped := stripLeadingHorizontalWhitespace line
+        let maximum :=
+          if blockCommentDepth == 0 && !stripped.isEmpty then
+            max maximum stripped.length
+          else
+            maximum
+        loop (blockCommentDepthAfterLine blockCommentDepth line) maximum rest
+  match (cleanTrivia text).splitOn "\n" with
+  | [] | [_] => 0
+  | firstLine :: rest =>
+      loop (blockCommentDepthAfterLine 0 firstLine) 0 rest
+
+def sourceCommentIndentCapacity? (text : String) (lineWidth : Nat) : Option Nat :=
+  let rec loop (blockCommentDepth capacity : Nat) (found : Bool)
+      : List String → Option Nat
+    | [] => if found then some capacity else none
+    | line :: rest =>
+        let stripped := stripLeadingHorizontalWhitespace line
+        let blockCommentDepthAfter := blockCommentDepthAfterLine blockCommentDepth line
+        if blockCommentDepth == 0 && !stripped.isEmpty then
+          let sourceIndent := line.length - stripped.length
+          if lineWidth < sourceIndent + stripped.length then
+            none
+          else
+            loop blockCommentDepthAfter
+              (min capacity (lineWidth - stripped.length)) true rest
+        else
+          loop blockCommentDepthAfter capacity found rest
+  match (cleanTrivia text).splitOn "\n" with
+  | [] | [_] => none
+  | firstLine :: rest =>
+      loop (blockCommentDepthAfterLine 0 firstLine) lineWidth false rest
+
+def commentIndentForWidth (text : String) (desiredIndent lineWidth : Nat) : Nat :=
+  let contentWidth := reindentableCommentWidth text
+  if contentWidth + desiredIndent <= lineWidth then
+    desiredIndent
+  else
+    match sourceCommentIndentCapacity? text lineWidth with
+    | some capacity => min desiredIndent capacity
+    | none => desiredIndent
+
+def standaloneSourceCommentIndent? (text : String) : Option Nat :=
+  match (normalizeLineEndings text).splitOn "\n" with
+  | [] | [_] => none
+  | _ :: rest =>
+      rest.findSome?
+        fun line =>
+          let stripped := stripLeadingHorizontalWhitespace line
+          if stripped.startsWith "--" || stripped.startsWith "/-" then
+            some (line.length - stripped.length)
+          else
+            none
+
+def commentTriviaForBreakWithFollowingIndent (text commentIndent followingIndent : String)
+    : String :=
+  let adjusted :=
+    if commentIndent == followingIndent || !commentTriviaHasSeparatedGroups text then
+      reindentCommentTrivia text commentIndent
+    else
+      reindentCommentTriviaWithFollowingGroup text commentIndent followingIndent
+  match (normalizeLineEndings adjusted).splitOn "\n" |>.reverse with
+  | lastLine :: rest =>
+      if (stripLeadingHorizontalWhitespace lastLine).isEmpty then
+        String.intercalate "\n" <| (followingIndent :: rest).reverse
+      else
+        (adjusted.dropEndWhile isHorizontalWhitespace).toString ++ "\n" ++ followingIndent
+  | [] => "\n" ++ followingIndent
+
+def commentTriviaForBreak (text indent : String) : String :=
+  commentTriviaForBreakWithFollowingIndent text indent indent
+
+def firstCommentColumn? (text : String) (firstLineColumn : Nat) : Option Nat :=
+  let rec firstCommentOffset? (offset : Nat) : List Char → Option Nat
+    | '-' :: '-' :: _ | '/' :: '-' :: _ => some offset
+    | _ :: rest => firstCommentOffset? (offset + 1) rest
+    | [] => none
+  let rec loop (firstLine : Bool) : List String → Option Nat
+    | [] => none
+    | line :: rest =>
+        match firstCommentOffset? 0 line.toList with
+        | some offset => some <| if firstLine then firstLineColumn + offset else offset
+        | none => loop false rest
+  loop true <| (normalizeLineEndings text).splitOn "\n"
+
+def alignCommentBoundaryLines
+    (attachedSourceIndent attachedTargetIndent sourceFollowingIndent : Nat)
+    (followingIndent : String)
+    : Nat → Nat → Nat → List String → List String
+  | _, _, _, [] => []
+  | blockCommentDepth, blockSourceIndent, blockTargetIndent, line :: rest =>
+      let stripped := stripLeadingHorizontalWhitespace line
+      if 0 < blockCommentDepth then
+        let adjusted := shiftCommentLineIndent blockSourceIndent blockTargetIndent line
+        let nextDepth := blockCommentDepthAfterLine blockCommentDepth line
+        adjusted
+        :: alignCommentBoundaryLines attachedSourceIndent attachedTargetIndent
+            sourceFollowingIndent followingIndent nextDepth blockSourceIndent
+            blockTargetIndent rest
+      else if rest.isEmpty && stripped.isEmpty then
+        [followingIndent]
+      else if stripped.isEmpty then
+        ""
+        :: alignCommentBoundaryLines attachedSourceIndent attachedTargetIndent
+            sourceFollowingIndent followingIndent 0 0 0 rest
+      else
+        let sourceIndent := line.length - stripped.length
+        let nextDepth := blockCommentDepthAfterLine 0 line
+        let belongsToFollowingTree := sourceIndent == sourceFollowingIndent
+        let adjusted :=
+          if belongsToFollowingTree then
+            followingIndent ++ stripped
+          else if stripped.startsWith "--"
+                  && sourceIndent + 1 == attachedSourceIndent then
+            shiftCommentLineIndent sourceIndent attachedTargetIndent line
+          else
+            shiftCommentLineIndent attachedSourceIndent attachedTargetIndent line
+        let blockSourceIndent :=
+          if belongsToFollowingTree then sourceFollowingIndent else attachedSourceIndent
+        let blockTargetIndent :=
+          if belongsToFollowingTree then followingIndent.length else attachedTargetIndent
+        adjusted
+        :: alignCommentBoundaryLines attachedSourceIndent attachedTargetIndent
+            sourceFollowingIndent followingIndent nextDepth blockSourceIndent
+            blockTargetIndent rest
+
+def commentTriviaForTreeBoundary (text : String)
+    (sourceCommentColumn targetCommentColumn sourceFollowingIndent : Nat)
+    (followingIndent : String)
+    : String :=
+  match (cleanTrivia text).splitOn "\n" with
+  | [] => "\n" ++ followingIndent
+  | firstLine :: rest =>
+      let firstBlockDepth := blockCommentDepthAfterLine 0 firstLine
+      String.intercalate "\n"
+      <| firstLine
+          :: alignCommentBoundaryLines sourceCommentColumn targetCommentColumn
+              sourceFollowingIndent followingIndent firstBlockDepth sourceCommentColumn
+              targetCommentColumn rest
+
+def moveLeadingCommentAfterToken? (text : String) : Option String :=
+  match (normalizeLineEndings text).splitOn "\n" with
+  | firstLine :: commentLine :: rest =>
+      let comment := stripLeadingHorizontalWhitespace commentLine
+      if (stripLeadingHorizontalWhitespace firstLine).isEmpty
+          && (comment.startsWith "--" || comment.startsWith "/-") then
+        some <| " " ++ String.intercalate "\n" (comment :: rest)
+      else
+        none
+  | _ => none
+
+def cleanFinalTrivia (text : String) : String :=
+  cleanTrivia text
+
+def isFinalWhitespace : Char → Bool
+  | '\n' => true
+  | char => isHorizontalWhitespace char
+
+def normalizeFinalNewline (text : String) : String :=
+  let normalized := normalizeLineEndings text
+  let withoutFinalWhitespace := (normalized.dropEndWhile isFinalWhitespace).toString
+  if withoutFinalWhitespace.isEmpty then
+    ""
+  else
+    withoutFinalWhitespace ++ "\n"
+
+def hasLineStructure (text : String) : Bool :=
+  (text.toByteArray.findIdx? (· == '\n'.toUInt8)).isSome
+
+def hasCommentStart (text : String) : Bool :=
+  (text.toByteArray.findIdx? (· == '-'.toUInt8)).isSome
+  && (containsSubstring text "--" || containsSubstring text "/-")
+
+def isCommentLexeme (text : String) : Bool :=
+  text.startsWith "--" || text.startsWith "/-" || text.endsWith "-/"
+
+def hasOnlyHorizontalTrivia (text : String) : Bool :=
+  !text.isEmpty && !hasLineStructure text && !hasCommentStart text
+
+def stringIn (value : String) (values : List String) : Bool :=
+  values.any fun candidate => candidate == value
+
+def stringEndsWithAny (value : String) (suffixes : List String) : Bool :=
+  suffixes.any fun suffix => value.endsWith suffix
+
+def stringStartsWithAny (value : String) (prefixes : List String) : Bool :=
+  prefixes.any fun candidate => value.startsWith candidate
+
+def noSpaceAfterToken (lexeme : String) : Bool :=
+  stringEndsWithAny lexeme ["(", "[", "⟨", "⟪", "⦃"]
+
+def allowsHorizontalAlignmentAfterToken (lexeme : String) : Bool :=
+  lexeme != "(" && lexeme != ":"
+
+def isTrailingSeparatorToken (lexeme : String) : Bool :=
+  stringIn lexeme [",", ",*", ";"]
+
+def isClosingDelimiterToken (lexeme : String) : Bool :=
+  stringStartsWithAny lexeme [")", "]", "⟩", "⟫", "⦄"]
+
+def noSpaceBeforeToken (lexeme : String) : Bool :=
+  isTrailingSeparatorToken lexeme || isClosingDelimiterToken lexeme
+
+def isPlainIdentifierTail (char : Char) : Bool :=
+  char.isAlphanum || char == '_' || char == '\''
+
+def isDelimiterCloserToken (lexeme : String) : Bool :=
+  stringStartsWithAny lexeme [")", "]", "}", "⟩", "⟫", "⦄"]
+
+def isOperatorLikeToken (lexeme : String) : Bool :=
+  match lexeme.toList.reverse with
+  | [] => false
+  | last :: _ =>
+      !isPlainIdentifierTail last
+      && last != '"'
+      && !isTrailingSeparatorToken lexeme
+      && !isDelimiterCloserToken lexeme
+
+def preservesSourceSpaceBeforeClosingToken (left right : SyntaxTree.Token) : Bool :=
+  isClosingDelimiterToken right.lexeme && isOperatorLikeToken left.lexeme
+
+def preservesTightBraceSpacing (left right : SyntaxTree.Token) : Bool :=
+  left.lexeme == "{" || right.lexeme == "}"
+
+def dotPrefixCanAttach (lexeme : String) : Bool :=
+  match lexeme.toList.reverse with
+  | '.' :: previous :: _ =>
+      previous.isAlphanum || previous == '_' || previous == '\'' || previous == '»'
+  | _ => false
+
+def preservesTightDotSpacing (left _right : SyntaxTree.Token) : Bool :=
+  left.lexeme == "."
+  || left.lexeme == "|>."
+  || (left.lexeme.endsWith "." && left.lexeme != ".." && dotPrefixCanAttach left.lexeme)
+
+def preservesTightPostfixSpacing (right : SyntaxTree.Token) : Bool :=
+  right.lexeme == "("
+  || right.lexeme == "["
+  || right.lexeme == "?"
+  || right.lexeme == "%"
+  || right.lexeme == "!"
+
+def preservesTightInterpolationSpacing (left right : SyntaxTree.Token) : Bool :=
+  left.lexeme == "s!"
+  || (left.lexeme != "{" && left.lexeme.endsWith "{")
+  || (right.lexeme != "}" && right.lexeme.startsWith "}")
+
+def preservesTightQuotedNameSpacing (left _right : SyntaxTree.Token) : Bool :=
+  left.lexeme == "`"
+
+def spaceBetweenTokens (left right : SyntaxTree.Token) : String :=
+  if left.lexeme.isEmpty || right.lexeme.isEmpty then
+    ""
+  else if left.lexeme == "!" then
+    if right.span.start == left.span.stop then "" else " "
+  else if noSpaceAfterToken left.lexeme
+          || noSpaceBeforeToken right.lexeme
+          || preservesTightDotSpacing left right
+          || preservesTightInterpolationSpacing left right
+          || preservesTightQuotedNameSpacing left right then
+    ""
+  else
+    " "
+
+def interTokenWhitespace
+    (source : String) (left right : SyntaxTree.Token) (preserveLines : Bool := true)
+    (normalizeAdjacent : Unit → Bool := fun _ => false)
+    : String :=
+  let trivia := SyntaxTree.sourceText source left.span.stop right.span.start
+  if hasCommentStart trivia then
+    if preserveLines || commentForcesLineBreak trivia then
+      cleanTrivia trivia
+    else
+      inlineCommentTrivia trivia
+  else if (isCommentLexeme left.lexeme || isCommentLexeme right.lexeme)
+          && hasLineStructure trivia then
+    cleanTrivia trivia
+  else if preserveLines && hasLineStructure trivia then
+    cleanTrivia trivia
+  else if trivia.isEmpty then
+    if normalizeAdjacent () then spaceBetweenTokens left right else ""
+  else if left.lexeme == "." && hasOnlyHorizontalTrivia trivia then
+    " "
+  else if preservesSourceSpaceBeforeClosingToken left right then
+    " "
+  else
+    spaceBetweenTokens left right
+
+end SpaceRules
+end Formatter
+end LeanFmt

@@ -1,0 +1,613 @@
+import LeanFmt.Driver.Files
+import LeanFmt.Driver.Status
+
+open System
+
+namespace LeanFmt.Driver
+
+structure ExceptionCounts where
+  codeChanged : Nat := 0
+  lineOverflow : Nat := 0
+  missingRule : Nat := 0
+  missingRuleWithRegisteredLeanFormatter : Nat := 0
+  missingRuleWithParserDescription : Nat := 0
+  missingRuleWithoutLeanFormatter : Nat := 0
+  formatFallback : Nat := 0
+  notIdempotent : Nat := 0
+deriving DecidableEq, Repr
+
+def ExceptionCounts.add (left right : ExceptionCounts) : ExceptionCounts :=
+  {
+    codeChanged := left.codeChanged + right.codeChanged
+    lineOverflow := left.lineOverflow + right.lineOverflow
+    missingRule := left.missingRule + right.missingRule
+    missingRuleWithRegisteredLeanFormatter :=
+      left.missingRuleWithRegisteredLeanFormatter
+      + right.missingRuleWithRegisteredLeanFormatter
+    missingRuleWithParserDescription :=
+      left.missingRuleWithParserDescription + right.missingRuleWithParserDescription
+    missingRuleWithoutLeanFormatter :=
+      left.missingRuleWithoutLeanFormatter + right.missingRuleWithoutLeanFormatter
+    formatFallback := left.formatFallback + right.formatFallback
+    notIdempotent := left.notIdempotent + right.notIdempotent
+  }
+
+def ExceptionCounts.isEmpty (counts : ExceptionCounts) : Bool :=
+  counts.codeChanged == 0
+  && counts.lineOverflow == 0
+  && counts.missingRule == 0
+  && counts.formatFallback == 0
+  && counts.notIdempotent == 0
+
+def ExceptionCounts.addFormattingException (counts : ExceptionCounts)
+    : Formatter.Diagnostics.FormattingException → ExceptionCounts
+  | .codeChanged => { counts with codeChanged := counts.codeChanged + 1 }
+  | .lineOverflow _ => { counts with lineOverflow := counts.lineOverflow + 1 }
+  | .missingRule _ => { counts with missingRule := counts.missingRule + 1 }
+
+def ExceptionCounts.addMissingRuleAudit (counts : ExceptionCounts)
+    : Formatter.Diagnostics.LeanFormatterAvailability → ExceptionCounts
+  | .registered =>
+      {
+        counts with
+          missingRuleWithRegisteredLeanFormatter :=
+            counts.missingRuleWithRegisteredLeanFormatter + 1
+      }
+  | .parserDescription =>
+      {
+        counts with
+          missingRuleWithParserDescription :=
+            counts.missingRuleWithParserDescription + 1
+      }
+  | .unavailable =>
+      {
+        counts with
+          missingRuleWithoutLeanFormatter := counts.missingRuleWithoutLeanFormatter + 1
+      }
+
+def ExceptionCounts.summary (counts : ExceptionCounts) : String :=
+  String.intercalate "\n"
+    [
+      "exception counts:",
+      s!"  code changed: {counts.codeChanged}",
+      s!"  line overflow: {counts.lineOverflow}",
+      s!"  missing rule: {counts.missingRule}",
+      s!"    registered Lean formatter: {counts.missingRuleWithRegisteredLeanFormatter}",
+      s!"    Lean parser description: {counts.missingRuleWithParserDescription}",
+      s!"    no Lean formatter metadata: {counts.missingRuleWithoutLeanFormatter}",
+      s!"  format fallback: {counts.formatFallback}",
+      s!"  not idempotent: {counts.notIdempotent}"
+    ]
+
+structure FileOutcome where
+  changed : Bool := false
+  failed : Bool := false
+  exceptionCounts : ExceptionCounts := {}
+deriving DecidableEq, Repr
+
+def reportFormattingException
+    (options : Options)
+    (path : FilePath) (exception : Formatter.Diagnostics.FormattingException)
+    (leanFormatter? : Option Formatter.Diagnostics.LeanFormatterAvailability := none)
+    : IO Unit :=
+  match exception with
+  | .codeChanged =>
+      IO.eprintln s!"non-whitespace changed: {path}"
+  | .lineOverflow occurrence => do
+      IO.eprintln
+        s!"line overflow: {path}:{occurrence.line}: {occurrence.width} > {options.formatterOptions.lineWidth}"
+      IO.eprintln occurrence.text
+  | .missingRule occurrence => do
+      IO.eprintln s!"missing rule: {path}:{occurrence.line}: {occurrence.kind}"
+      if let some availability := leanFormatter? then
+        IO.eprintln s!"Lean formatter: {availability.description}"
+      IO.eprintln
+      <| if occurrence.treeText.isEmpty then "<empty>" else occurrence.treeText
+
+def runDiagnosticChecks
+    (env : Lean.Environment)
+    (options : Options)
+    (path : FilePath)
+    (source : String) (sourceModule formattedModule : SyntaxTree.Module)
+    : IO ExceptionCounts := do
+  let formatted := formattedModule.source
+  let exceptions :=
+    (if options.checkException then
+        Formatter.Diagnostics.formattingSafetyExceptions
+          sourceModule formattedModule options.formatterOptions
+      else
+        [])
+    ++ if options.checkMissingRules then
+          Formatter.Diagnostics.missingRuleExceptions sourceModule
+        else
+          []
+  let mut exceptionCounts : ExceptionCounts := {}
+  for exception in exceptions do
+    let leanFormatter? :=
+      match exception with
+      | .missingRule occurrence =>
+          some
+          <| Formatter.Diagnostics.leanFormatterAvailability env occurrence.syntaxKind?
+      | _ => none
+    reportFormattingException options path exception leanFormatter?
+    exceptionCounts := exceptionCounts.addFormattingException exception
+    if let some availability := leanFormatter? then
+      exceptionCounts := exceptionCounts.addMissingRuleAudit availability
+  if options.checkIdempotent && formatted != source then
+    let formattedAgain ←
+      Formatter.formatSourceWithEnv env formatted path.toString options.formatterOptions
+    if formattedAgain != formatted then
+      IO.eprintln s!"not idempotent: {path}"
+      exceptionCounts :=
+        { exceptionCounts with notIdempotent := exceptionCounts.notIdempotent + 1 }
+  pure exceptionCounts
+
+def formatSourceWithEnvForFile
+    (env : Lean.Environment) (options : Options) (path : FilePath) (source : String)
+    : IO FileOutcome := do
+  try
+    let (sourceModule, convergence) ←
+      Formatter.Internal.formatSourceWithModules env source path.toString
+        options.formatterOptions
+    let result := convergence.toFormatResult
+    let formatted := result.formatted
+    let exceptionCounts ←
+      match convergence with
+      | .fallback _ =>
+          IO.eprintln s!"format fallback: {path}"
+          pure { formatFallback := 1 }
+      | .converged formattedModule =>
+          runDiagnosticChecks env options path source sourceModule formattedModule
+    let changed := !result.fellBack && formatted != source
+    if changed && !options.check then
+      IO.FS.writeFile path formatted
+      IO.println s!"formatted {path}"
+    if !exceptionCounts.isEmpty then
+      pure { changed, failed := true, exceptionCounts }
+    else if !changed then
+      pure {}
+    else if options.check then
+      IO.eprintln s!"needs formatting: {path}"
+      pure { changed := true }
+    else
+      pure { changed := true }
+  catch error =>
+    IO.eprintln s!"leanfmt: {path}: {error}"
+    pure { failed := true }
+
+def formatFileWithEnv (env : Lean.Environment) (options : Options) (path : FilePath)
+    : IO FileOutcome := do
+  let (source, readMs) ← timeIO <| IO.FS.readFile path
+  let (outcome, formatMs) ← timeIO <| formatSourceWithEnvForFile env options path source
+  profileLine options
+    s!"{path}: read={readMs}ms environment=0ms format={formatMs}ms total={readMs + formatMs}ms"
+  pure outcome
+
+def formatFile (loader : EnvironmentLoader) (options : Options) (path : FilePath)
+    : IO FileOutcome := do
+  try
+    let totalStart ← IO.monoMsNow
+    let (source, readMs) ← timeIO <| IO.FS.readFile path
+    let (env, environmentMs) ←
+      timeIO
+      <| if options.profile then
+            loader.environmentForSourceProfiled options source path.toString
+          else
+            loader.environmentForSource options source path.toString
+    let (outcome, formatMs) ← timeIO <| formatSourceWithEnvForFile env options path source
+    let totalStop ← IO.monoMsNow
+    profileLine options
+      s!"{path}: read={readMs}ms environment={environmentMs}ms format={formatMs}ms total={totalStop - totalStart}ms"
+    pure outcome
+  catch error =>
+    IO.eprintln s!"leanfmt: {path}: {error}"
+    pure { failed := true }
+
+inductive WorkerEnvironment where
+  | default
+  | exact
+
+def WorkerEnvironment.description : WorkerEnvironment → String
+  | .default => "default"
+  | .exact => "exact"
+
+def Options.workerArgs
+    (options : Options) (environment : WorkerEnvironment) (files : List FilePath)
+    : Array String :=
+  Id.run do
+    let mut args :=
+      match environment with
+      | .default => #["--worker-default-environment"]
+      | .exact => #["--worker"]
+    if options.check then
+      args := args.push "--check"
+    if options.checkException then
+      args := args.push "--check-exception"
+    if options.checkMissingRules then
+      args := args.push "--check-missing-rules"
+    if options.checkIdempotent then
+      args := args.push "--check-idempotent"
+    if options.profile then
+      args := args.push "--profile"
+    if options.importEnvFirst then
+      args := args.push "--import-env-first"
+    if options.includeHidden then
+      args := args.push "--include-hidden"
+    args := args.push "--env-cache-size"
+    args := args.push s!"{options.importPrefixCacheSize}"
+    args := args.push "--line-width"
+    args := args.push s!"{options.formatterOptions.lineWidth}"
+    for file in files do
+      args := args.push file.toString
+    args
+
+def expectedLeanToolchain : String :=
+  s!"leanprover/lean4:v{Lean.versionString}"
+
+def checkWorkerToolchain (cwd? : Option FilePath) : IO Bool := do
+  match cwd? with
+  | none => pure true
+  | some cwd =>
+      let toolchainFile := cwd / "lean-toolchain"
+      if !(← toolchainFile.pathExists) then
+        pure true
+      else
+        let targetToolchain := (← IO.FS.readFile toolchainFile).trimAscii.toString
+        if targetToolchain == expectedLeanToolchain then
+          pure true
+        else
+          IO.eprintln
+            s!"leanfmt: target package uses {targetToolchain}, but this formatter was built with {expectedLeanToolchain}"
+          IO.eprintln
+            "leanfmt: rebuild/run leanfmt with the target package's Lean toolchain, or rebuild the target package with this Lean version"
+          pure false
+
+def workerExecutable : IO FilePath := do
+  let executable ← IO.appPath
+  if executable.fileName == some "lean" then
+    pure ".lake/build/bin/fmt"
+  else
+    pure executable
+
+def shouldUseWorker (options : Options) (fileCount : Nat) : Bool :=
+  !options.worker && fileCount > 1
+
+def defaultWorkerJobs (hardwareConcurrency : Nat) : Nat :=
+  max 1 hardwareConcurrency
+
+def configuredWorkerJobs (options : Options) : Nat :=
+  max 1 <| options.workerJobs?.getD (defaultWorkerJobs options.hardwareConcurrency)
+
+/-- Spread files from largest to smallest across the available worker batches. -/
+def spreadSizedItems (batchCount : Nat) (items : List (α × Nat)) : List (List α) :=
+  if batchCount == 0 || items.isEmpty then
+    []
+  else
+    let batchCount := min batchCount items.length
+    let sorted := items.mergeSort fun left right => right.2 < left.2
+    let (_, batches) :=
+      sorted.foldl
+        (fun (index, batches) (item, _) =>
+          let batchIndex := index % batchCount
+          (index + 1, batches.set! batchIndex (item :: batches[batchIndex]!)))
+        (0, Array.replicate batchCount [])
+    batches.toList.map List.reverse
+
+def parseLakeEnvironment (output : String)
+    : Except String (Array (String × Option String)) := do
+  let mut environment := #[]
+  for rawLine in output.splitOn "\n" do
+    let line := rawLine.trimAscii.toString
+    if !line.isEmpty then
+      match line.splitOn "=" with
+      | [] => throw s!"invalid empty `lake env` line"
+      | name :: values =>
+          if name.isEmpty || values.isEmpty then
+            throw s!"invalid `lake env` line: {line}"
+          let value := String.intercalate "=" values
+          environment :=
+            environment.push (name, if value.isEmpty then none else some value)
+  pure environment
+
+def setWorkerEnvironmentVariable
+    (environment : Array (String × Option String))
+    (name : String) (value : Option String)
+    : Array (String × Option String) :=
+  (environment.filter fun entry => entry.1 != name).push (name, value)
+
+def nativeLibrariesEnvironmentVariable : String :=
+  "LEANFMT_LOAD_DYNLIBS"
+
+def pluginsEnvironmentVariable : String :=
+  "LEANFMT_LOAD_PLUGINS"
+
+def runtimePaths (value : String) : List FilePath :=
+  let separator := if System.Platform.isWindows then ';' else ':'
+  (value.split fun char => char == separator)
+  |>.toList
+  |>.map (·.toString)
+  |>.filter (fun path => !path.isEmpty)
+  |>.map FilePath.mk
+
+def nativeLibraryPaths (value : String) : List FilePath :=
+  runtimePaths value
+
+def loadRequestedNativeLibraries : IO Unit := do
+  match ← IO.getEnv nativeLibrariesEnvironmentVariable with
+  | some value => (nativeLibraryPaths value).forM Lean.loadDynlib
+  | none => pure ()
+
+def loadRequestedPlugins : IO Unit := do
+  match ← IO.getEnv pluginsEnvironmentVariable with
+  | some value =>
+      Lean.withImporting do (runtimePaths value).forM fun path => Lean.loadPlugin path
+  | none => pure ()
+
+def inheritRequestedRuntimeEnvironment (environment : Array (String × Option String))
+    : IO (Array (String × Option String)) := do
+  let mut environment := environment
+  for name in [nativeLibrariesEnvironmentVariable, pluginsEnvironmentVariable] do
+    if let some value ← IO.getEnv name then
+      environment := setWorkerEnvironmentVariable environment name (some value)
+  pure environment
+
+structure WorkerProcessContext where
+  executable : FilePath
+  environment : Array (String × Option String)
+
+def loadWorkerProcessContext (cwd? : Option FilePath) : IO WorkerProcessContext := do
+  let some cwd := cwd?
+  | return { executable := ← workerExecutable, environment := #[] }
+  let lake := (← IO.getEnv "LAKE").getD "lake"
+  let output ← IO.Process.output { cmd := lake, args := #["env"], cwd := some cwd }
+  if output.exitCode != 0 then
+    let detail := output.stderr.trimAscii.toString
+    throw
+    <| IO.userError
+    <| if detail.isEmpty then
+          s!"`{lake} env` exited with code {output.exitCode}"
+        else
+          s!"`{lake} env` exited with code {output.exitCode}: {detail}"
+  let lakeEnvironment ←
+    match parseLakeEnvironment output.stdout with
+    | .ok environment => pure environment
+    | .error message => throw <| IO.userError message
+  let environment ← inheritRequestedRuntimeEnvironment lakeEnvironment
+  pure { executable := ← workerExecutable, environment }
+
+structure WorkerBatchResult where
+  exitCode : UInt32
+  elapsedMs : Nat
+
+structure WorkerBatch where
+  files : List FilePath
+  environmentCount : Nat
+
+def exactEnvironmentWorkerBatches (groups : List ImportHeaderGroup) : List WorkerBatch :=
+  groups.map fun group => { files := group.files, environmentCount := 1 }
+
+structure IndexedWorkerBatchResult where
+  batchIndex : Nat
+  fileCount : Nat
+  environmentCount : Nat
+  result : Except IO.Error WorkerBatchResult
+
+def workerProgressMessage
+    (environment : WorkerEnvironment)
+    (completedFiles totalFiles completedBatches totalBatches runningBatches : Nat)
+    : String :=
+  s!"leanfmt: formatting {environment.description} environments: {completedFiles}/{totalFiles} files, {completedBatches}/{totalBatches} batches, {runningBatches} running"
+
+def relayWorkerOutput
+    (status : StatusRenderer) (out : IO.FS.Stream) (input : IO.FS.Handle)
+    : IO Unit := do
+  let terminal ← out.isTty
+  repeat
+    let line ← input.getLine
+    if line.isEmpty then return
+    status.withOutput do
+      out.putStr line
+      if terminal && !line.endsWith "\n" then
+        out.putStr "\n"
+      out.flush
+
+def runEnvironmentWorkerBatch
+    (process : WorkerProcessContext)
+    (status : StatusRenderer) (stdout : IO.FS.Stream)
+    (options : Options) (environment : WorkerEnvironment)
+    (cwd? : Option FilePath)
+    (inputFiles : List FilePath)
+    : IO WorkerBatchResult := do
+  let files ← pathsForWorkerCwd cwd? inputFiles
+  let (exitCode, elapsedMs) ←
+    timeIO
+    <| do
+      let args : IO.Process.SpawnArgs :=
+        {
+          cmd := process.executable.toString
+          args := options.workerArgs environment files
+          cwd := cwd?
+          env := process.environment
+          stdin := .null
+          stdout := .inherit
+          stderr := .inherit
+        }
+      if !status.enabled then
+        return ← (← IO.Process.spawn args).wait
+      let child ← IO.Process.spawn { args with stdout := .piped, stderr := .piped }
+      let relay (out : IO.FS.Stream) (input : IO.FS.Handle) := do
+        try
+          relayWorkerOutput status out input
+        catch error =>
+          try
+            child.kill
+          catch _ =>
+            pure ()
+          throw error
+      -- Drain both pipes while the worker runs; never retain a complete batch log.
+      let output ← IO.asTask (prio := .dedicated) (relay stdout child.stdout)
+      let errors ← (relay status.out child.stderr).toBaseIO
+      -- A failed reader may still terminate the child; join both before reaping it.
+      let output ← IO.wait output
+      let exitCode ← child.wait
+      IO.ofExcept output
+      IO.ofExcept errors
+      pure exitCode
+  pure { exitCode, elapsedMs }
+
+def reportWorkerBatchResult
+    (options : Options) (environment : WorkerEnvironment)
+    (batchIndex totalBatches fileCount environmentCount : Nat)
+    (result : Except IO.Error WorkerBatchResult)
+    : IO Bool := do
+  match result with
+  | .ok result =>
+      if result.exitCode != 0 then
+        IO.eprintln
+          s!"leanfmt: worker batch {batchIndex}/{totalBatches} exited with code {result.exitCode}"
+      profileLine options
+        s!"worker-batch: index={batchIndex}/{totalBatches} environment={environment.description} environments={environmentCount} files={fileCount} exit={result.exitCode} elapsed={result.elapsedMs}ms"
+      pure (result.exitCode != 0)
+  | .error error =>
+      IO.eprintln s!"leanfmt: worker batch {batchIndex}/{totalBatches}: {error}"
+      pure true
+
+def runEnvironmentWorkerBatches
+    (process : WorkerProcessContext)
+    (options : Options) (environment : WorkerEnvironment)
+    (cwd? : Option FilePath) (workerJobs : Nat) (batches : List WorkerBatch)
+    : IO UInt32 := do
+  if batches.isEmpty then
+    return 0
+  let workerJobs := min (max 1 workerJobs) batches.length
+  let totalFiles := batches.foldl (fun count batch => count + batch.files.length) 0
+  let mut remaining := batches.zipIdx
+  let mut active : List (Task IndexedWorkerBatchResult) := []
+  let mut completedFiles := 0
+  let mut completedBatches := 0
+  let mut failed := false
+  let status ← StatusRenderer.create (← IO.getStderr)
+  let stdout ← IO.getStdout
+  while !remaining.isEmpty || !active.isEmpty do
+    while active.length < workerJobs && !remaining.isEmpty do
+      match remaining with
+      | [] => pure ()
+      | (batch, batchIndex) :: rest =>
+          let task ←
+            IO.asTask (prio := .dedicated)
+              (runEnvironmentWorkerBatch process status stdout options environment cwd?
+                batch.files)
+          active :=
+            (task.map (sync := true)
+              fun result =>
+                {
+                  batchIndex
+                  fileCount := batch.files.length
+                  environmentCount := batch.environmentCount
+                  result
+                })
+            :: active
+          remaining := rest
+    status.render
+    <| workerProgressMessage environment completedFiles totalFiles
+        completedBatches batches.length active.length
+    match active with
+    | [] => pure ()
+    | task :: rest =>
+        let (result, unfinished) ← IO.waitAny' (task :: rest)
+        failed :=
+          (← status.withOutput
+              <| reportWorkerBatchResult options
+                  environment
+                  (result.batchIndex + 1) batches.length result.fileCount
+                  result.environmentCount result.result)
+          || failed
+        completedFiles := completedFiles + result.fileCount
+        completedBatches := completedBatches + 1
+        active := unfinished
+  status.clear
+  pure <| if failed then 1 else 0
+
+def runExactEnvironmentWorkerBatches
+    (process : WorkerProcessContext)
+    (options : Options) (cwd? : Option FilePath) (groups : List ImportHeaderGroup)
+    : IO UInt32 := do
+  let requestedJobs := configuredWorkerJobs options
+  let groupBatches := exactEnvironmentWorkerBatches groups
+  let fileCount := groups.foldl (fun count group => count + group.files.length) 0
+  profileLine options
+    s!"worker-batches: environment=exact files={fileCount} environments={groups.length} batches={groupBatches.length} jobs={min requestedJobs groupBatches.length} environments-per-worker=1"
+  runEnvironmentWorkerBatches process options .exact cwd? requestedJobs groupBatches
+
+def summarizeOutcomes (options : Options) (outcomes : List FileOutcome) : IO UInt32 := do
+  let changed := outcomes.any (·.changed)
+  let failed := outcomes.any (·.failed)
+  let exceptionCounts : ExceptionCounts :=
+    outcomes.foldl (fun counts outcome => counts.add outcome.exceptionCounts) {}
+  if !exceptionCounts.isEmpty then
+    IO.eprintln exceptionCounts.summary
+  let diagnosticMode :=
+    options.checkException || options.checkMissingRules || options.checkIdempotent
+  let formattingDifferenceFailed := options.check && !diagnosticMode && changed
+  pure <| if failed || formattingDifferenceFailed then 1 else 0
+
+def formatDefaultEnvironmentFiles
+    (loader : EnvironmentLoader) (options : Options) (files : List FilePath)
+    : IO UInt32 := do
+  let (outcomes, elapsedMs) ←
+    timeIO <| files.mapM (formatFileWithEnv loader.default options)
+  profileLine options
+    s!"default-environment-files: files={files.length} elapsed={elapsedMs}ms"
+  summarizeOutcomes options outcomes
+
+def runDefaultEnvironmentFiles
+    (process : WorkerProcessContext)
+    (loader : EnvironmentLoader) (options : Options) (cwd? : Option FilePath)
+    (sizedFiles : List (FilePath × Nat))
+    : IO UInt32 := do
+  if sizedFiles.isEmpty then
+    return 0
+  let files := sizedFiles.map (·.1)
+  let requestedJobs := configuredWorkerJobs options
+  let batchCount := min files.length requestedJobs
+  let fileBatches := spreadSizedItems batchCount sizedFiles
+  let batches := fileBatches.map fun files => { files, environmentCount := 1 }
+  if batches.length ≤ 1 then
+    formatDefaultEnvironmentFiles loader options files
+  else
+    profileLine options
+      s!"worker-batches: environment=default files={files.length} environments=1 batches={batches.length} jobs={min requestedJobs batches.length}"
+    runEnvironmentWorkerBatches process options .default cwd? requestedJobs batches
+
+def runMixedWorkerBatches
+    (loader : EnvironmentLoader) (options : Options) (cwd? : Option FilePath)
+    (files : List FilePath)
+    : IO UInt32 := do
+  let requestedJobs := configuredWorkerJobs options
+  let ((defaultFiles, importFiles), partitionMs) ←
+    timeIO <| partitionDefaultEnvironmentFiles loader requestedJobs files
+  profileLine options
+    s!"partition: files={files.length} default={defaultFiles.length} import={importFiles.length} elapsed={partitionMs}ms"
+  let (process?, setupMs) ←
+    timeIO
+    <| try
+      some <$> loadWorkerProcessContext cwd?
+    catch error =>
+      IO.eprintln s!"leanfmt: could not establish target Lake environment: {error}"
+      pure none
+  let some process := process? | return 1
+  profileLine options
+    s!"worker-process-environment: variables={process.environment.size} elapsed={setupMs}ms"
+  let defaultExitCode ←
+    runDefaultEnvironmentFiles process loader options cwd? defaultFiles
+  let importExitCode ←
+    if importFiles.isEmpty then
+      pure 0
+    else
+      let (exactGroups, groupingMs) ← timeIO <| exactImportHeaderGroups importFiles
+      profileLine options
+        s!"import-groups: files={importFiles.length} groups={exactGroups.length} strategy=exact-lean-environments elapsed={groupingMs}ms"
+      runExactEnvironmentWorkerBatches process options cwd? exactGroups
+  pure <| if defaultExitCode != 0 || importExitCode != 0 then 1 else 0
+
+end LeanFmt.Driver

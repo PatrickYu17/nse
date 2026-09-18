@@ -1,0 +1,36 @@
+name = "leanfmt"
+version = "0.4.4"
+description = "A structure-preserving code formatter for Lean"
+keywords = ["lean4", "formatter", "devtool", "development-tools"]
+license = "MIT"
+defaultTargets = ["LeanFmt", "fmt"]
+testDriver = "testSuite"
+
+[[lean_lib]]
+name = "LeanFmt"
+
+[[lean_lib]]
+name = "LeanFmt.Tests"
+roots = ["LeanFmt.Tests.Suite"]
+
+[[lean_exe]]
+name = "fmt"
+root = "LeanFmt.Main"
+supportInterpreter = true
+
+[[lean_exe]]
+name = "fmt-test"
+root = "LeanFmt.Tests.Main"
+supportInterpreter = true
+
+[[lean_exe]]
+name = "testSuite"
+root = "LeanFmt.Tests.Run"
+needs = ["fmt"]
+supportInterpreter = true
+
+[[lean_exe]]
+name = "compatibilityTest"
+root = "LeanFmt.Tests.Compatibility"
+needs = ["fmt"]
+supportInterpreter = true
