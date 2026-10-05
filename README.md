@@ -1,5 +1,7 @@
 # No-Slop Engineering (NSE)
 
+PROOF-OF-CONCEPT!!! I used this a little bit for experementing. by no means is this a strong qualified final product of a skill. Great for some workflows but really bad for others. Most CRUD SaaS slop wont need this and any e2e framework will do.
+
 AI slop kinda sucks. This is my way of trying to mitigate slop in the backend with agentic coding.
 
 This skill doesn't touch design so you can use your own design skills, etc.
